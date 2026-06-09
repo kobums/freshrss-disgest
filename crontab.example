@@ -1,0 +1,11 @@
+# crontab -e 에 추가 (경로/사용자는 실제 환경에 맞게 변경)
+# 매일 새벽 4시에 안 읽은 글을 요약해 노션에 적재하고 읽음 처리한다.
+#
+# ── Docker 실행 (권장: 서버에 python/claude 직접 설치 불필요) ──
+# - --env-file : FreshRSS/Notion 비밀값 + CLAUDE_CODE_OAUTH_TOKEN(요약 인증, 과금 0)
+# - -v ...:/data : seen 파일 보관 (읽음 처리 실패 대비 안전망)
+0 4 * * * cd /home/youruser/freshrss-digest && /usr/bin/docker run --rm --env-file .env -v /home/youruser/freshrss-digest/digest-data:/data kobums/freshrss-digest:latest >> /home/youruser/freshrss-digest/digest.log 2>&1
+
+# ── (대안) Docker 없이 호스트에서 직접 ──
+# 호스트에 python3 + Claude Code(구독 로그인)가 있어야 함.
+# 0 4 * * * /home/youruser/freshrss-digest/run.sh >> /home/youruser/freshrss-digest/digest.log 2>&1
