@@ -1,0 +1,16 @@
+# 비밀값 — 절대 커밋 금지 (NOTION_TOKEN, FreshRSS API 비번)
+.env
+.env.local
+
+# FreshRSS 런타임 데이터
+freshrss-data/
+freshrss-extensions/
+
+# 실행 산출물
+*.log
+digest-data/
+.freshrss_digest_seen.json
+
+.DS_Store
+__pycache__/
+*.pyc
