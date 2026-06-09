@@ -1,0 +1,23 @@
+# FreshRSS — gowoobro.com 서버에서 RSS 동기화 백엔드로 사용
+# 로컬 포트(8085)에만 바인딩하고, 외부 노출은 nginx 리버스 프록시가 담당한다.
+services:
+  freshrss:
+    image: freshrss/freshrss:latest
+    container_name: freshrss
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Seoul
+      - CRON_MIN=*/20            # FreshRSS 내부 피드 갱신 주기 (20분마다)
+    volumes:
+      - ./freshrss-data:/var/www/FreshRSS/data
+      - ./freshrss-extensions:/var/www/FreshRSS/extensions
+    ports:
+      - "127.0.0.1:8085:80"      # 호스트 8085 → 컨테이너 80. nginx가 127.0.0.1:8085로 프록시
+
+# 이미 운영 중인 docker 네트워크(예: data_appnet)에 붙이고 싶으면
+# 위 ports 대신 아래처럼 networks를 쓰고 nginx에서 컨테이너명(freshrss:80)으로 프록시해도 된다.
+#    networks: [appnet]
+# networks:
+#   appnet:
+#     external: true
+#     name: data_appnet
