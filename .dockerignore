@@ -1,0 +1,14 @@
+# 이미지에 들어갈 필요 없는 것들 (빌드 컨텍스트 최소화 + 비밀값 유출 방지)
+.env
+.env.*
+!.env.example
+freshrss-data/
+freshrss-extensions/
+*.log
+.git/
+.gitignore
+.DS_Store
+README.md
+docker-compose.yml
+nginx-rss.conf.example
+crontab.example
