@@ -118,6 +118,10 @@ def html_to_text(html):
     except Exception:
         pass
     text = "".join(parser.parts)
+    # 널 바이트·제어문자 제거 (\t \n \r 만 남김).
+    # 본문에 \x00 이 있으면 claude -p 호출 시 subprocess 가
+    # "embedded null byte" 로 터지므로 여기서 한 번에 거른다.
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n+", "\n\n", text)
     return text.strip()
@@ -159,6 +163,7 @@ def claude_summarize(title, source, text):
         f"\"tags\": [\"주제 태그 2~4개, 가능하면 다음 중에서: {', '.join(KNOWN_TAGS)}\"]}}\n\n"
         f"제목: {title}\n출처: {source}\n\n본문:\n{text}"
     )
+    prompt = prompt.replace("\x00", "")  # subprocess 는 인자에 널 바이트가 있으면 거부
     cmd = [CLAUDE_BIN, "-p", prompt]
     if CLAUDE_MODEL:
         cmd += ["--model", CLAUDE_MODEL]
