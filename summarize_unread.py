@@ -5,6 +5,8 @@ Reeder(안 읽은 글) → FreshRSS → claude -p 요약 → Notion → 읽음 �
 매일 새벽, 안 읽은(unread) 글을 가져와 Claude Code(`claude -p`)로 한국어 요약한 뒤
 Notion 'Reeder 읽기 요약' DB에 카드로 쌓고, 처리한 글은 FreshRSS에서 읽음 처리한다.
 (읽음 처리가 곧 중복 방지 — 다음 실행 때 다시 잡히지 않음)
+발행된 지 MAX_AGE_DAYS일이 넘은 글은 요약하지 않고 읽음 처리만 한다.
+(블로그가 주소를 옮기면 FreshRSS가 예전 글 전체를 새 글로 다시 받기 때문)
 
 특징:
 - 요약은 Claude Code 구독으로 처리 → 토큰당 API 과금 없음 (구독 사용량 한도 사용)
@@ -17,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,6 +39,8 @@ NOTION_VERSION = "2022-06-28"
 
 MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "40"))    # 한 번에 처리할 최대 개수
 MARK_READ = os.environ.get("MARK_READ", "1") == "1"   # 0이면 읽음 처리 안 함(테스트용)
+# 발행된 지 이 일수가 넘은 글은 요약하지 않고 읽음 처리만 한다. 0이면 끈다(모든 글을 요약).
+MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS") or "30")
 SEEN_FILE = os.environ.get(
     "SEEN_FILE", os.path.expanduser("~/.freshrss_digest_seen.json")
 )
@@ -87,6 +92,23 @@ def mark_read(auth, token, item_id):
     url = f"{FRESHRSS_BASE}/api/greader.php/reader/api/0/edit-tag"
     _request(url, data={"T": token, "i": item_id, "a": READ_TAG},
              headers=greader_headers(auth), method="POST")
+
+
+def published_time(item):
+    """글의 발행 시각(초). 없거나 읽을 수 없으면 None."""
+    try:
+        published = float(item.get("published"))
+    except (TypeError, ValueError):
+        return None
+    return published if published > 0 else None
+
+
+def is_stale(published, now=None):
+    """발행된 지 MAX_AGE_DAYS일이 넘은 글인가. 발행 시각을 모르면 새 글로 본다."""
+    if MAX_AGE_DAYS <= 0 or not published:
+        return False
+    now = time.time() if now is None else now
+    return now - published > MAX_AGE_DAYS * 86400
 
 
 # ── 본문 추출 ─────────────────────────────────────────────────────
@@ -268,15 +290,25 @@ def main():
 
     write_token = get_write_token(auth) if (MARK_READ and todo) else None
     done = 0
+    skipped = 0
     for it in todo:
         iid = it.get("id", "")
         title = it.get("title", "(제목 없음)")
         source = (it.get("origin") or {}).get("title", "")
         url = item_url(it)
-        published = it.get("published")
+        published = published_time(it)
         date_iso = (datetime.date.fromtimestamp(published).isoformat()
                     if published else datetime.date.today().isoformat())
         try:
+            # 오래된 글은 요약하지 않고 읽음으로만 넘긴다 (피드 주소 이전으로 옛 글이 몰려올 때)
+            if is_stale(published):
+                if MARK_READ:
+                    if write_token:
+                        mark_read(auth, write_token, iid)
+                    seen.add(iid)
+                skipped += 1
+                print(f"  ⏭ {title} — {date_iso} 발행, {MAX_AGE_DAYS}일이 넘어 요약 안 함")
+                continue
             summary = claude_summarize(title, source, item_text(it))
             notion_create(title, source, url, date_iso,
                           summary["tags"], summary["summary_line"],
@@ -297,7 +329,9 @@ def main():
 
     if MARK_READ:
         save_seen(seen)
-    print(f"완료: {done}개 노션에 추가" + (", 읽음 처리됨" if MARK_READ else ""))
+    print(f"완료: {done}개 노션에 추가" + (", 읽음 처리됨" if MARK_READ else "")
+          + (f" · 오래된 글 {skipped}개는 요약 없이 "
+             + ("읽음 처리" if MARK_READ else "건너뜀") if skipped else ""))
 
 
 if __name__ == "__main__":
