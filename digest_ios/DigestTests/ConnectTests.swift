@@ -43,9 +43,9 @@ struct ConnectTests {
     }
 
     @Test func databaseIDIsExtractedFromAddressOrID() {
-        let id = "ba591c8b4bda4127b1a75fa6dc455f85"
+        let id = "0123456789abcdef0123456789abcdef"
         #expect(Connection.databaseID(from: id) == id)
-        #expect(Connection.databaseID(from: "  BA591C8B-4BDA-4127-B1A7-5FA6DC455F85\n") == id)
+        #expect(Connection.databaseID(from: "  01234567-89AB-CDEF-0123-456789ABCDEF\n") == id)
         // 주소 뒤의 보기 ID(?v=)가 아니라 앞의 DB ID를 쓴다
         #expect(Connection.databaseID(from: "https://www.notion.so/workspace/\(id)?v=11111111111111111111111111111111") == id)
         #expect(Connection.databaseID(from: "https://www.notion.so/Reeder-\(id)") == id)

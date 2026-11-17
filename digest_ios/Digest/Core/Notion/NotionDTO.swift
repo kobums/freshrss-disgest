@@ -149,10 +149,22 @@ extension Card {
             publishedDay: p[NotionSchema.date]?.date?.start.map { String($0.prefix(10)) },
             tags: (p[NotionSchema.tags]?.multiSelect ?? []).map { CardTag(name: $0.name, color: $0.color ?? "default") },
             source: p[NotionSchema.source]?.richText?.plainText ?? "",
-            link: p[NotionSchema.link]?.url.flatMap { URL(string: $0) },
+            link: p[NotionSchema.link]?.url.flatMap { URL(webString: $0) },
             summary: p[NotionSchema.summary]?.richText?.plainText ?? "",
-            notionURL: page.url.flatMap { URL(string: $0) }
+            notionURL: page.url.flatMap { URL(webString: $0, httpsOnly: true) }
         )
+    }
+}
+
+extension URL {
+    /// 웹 주소만 받는다. 링크는 피드가 정한 값이라 `tel:`이나 다른 앱의 스킴이 올 수 있고,
+    /// 그런 값은 "원문 보기"가 엉뚱한 앱을 띄우지 않게 버린다.
+    init?(webString: String, httpsOnly: Bool = false) {
+        guard let url = URL(string: webString.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "https" || (!httpsOnly && scheme == "http"),
+              url.host?.isEmpty == false else { return nil }
+        self = url
     }
 }
 

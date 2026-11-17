@@ -3,7 +3,6 @@ import SwiftUI
 /// 상세: 제목, 한줄요약, 핵심. 아래 툴바에서 원문을 열고 이전·다음 글로 넘긴다.
 struct CardDetailScreen: View {
     @Environment(AppState.self) private var app
-    @Environment(\.openURL) private var openURL
 
     /// 지금 보고 있는 카드. 이전·다음을 누르면 화면을 새로 밀지 않고 이 값만 바꾼다.
     @State private var cardID: String
@@ -28,7 +27,8 @@ struct CardDetailScreen: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbar }
         .webSheet($webLink)
-        .task(id: cardID) {
+        // 읽는 중에 카드가 고쳐지면 받아 둔 핵심이 낡은 것이 되므로 다시 받는다
+        .task(id: BodyKey(cardID: cardID, editedAt: card?.editedAt)) {
             if let card { await app.loadBody(for: card) }
         }
     }
@@ -142,14 +142,15 @@ struct CardDetailScreen: View {
         }
     }
 
+    /// 원문은 앱 안 Safari로만 연다. 웹 주소가 아니면 열지 않는다.
     private func openOriginal() {
-        guard let url = card?.link else { return }
-        if let link = WebLink(url) {
-            webLink = link
-        } else {
-            openURL(url)
-        }
+        webLink = card?.link.flatMap(WebLink.init)
     }
+}
+
+private struct BodyKey: Hashable {
+    let cardID: String
+    let editedAt: Date?
 }
 
 /// 본문 블록 묶음. 핵심(불릿)이 대부분이고, Notion에서 덧붙인 문단·소제목도 그린다.
@@ -204,8 +205,6 @@ struct BodyBlocks: View {
 /// 카드에 할 수 있는 일: 공유 · 요약 복사 · Notion에서 열기
 struct CardActionsMenu: View {
     let card: Card
-    @Environment(AppState.self) private var app
-    @Environment(\.openURL) private var openURL
 
     var body: some View {
         Menu("더 보기", systemImage: "ellipsis") {

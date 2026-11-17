@@ -19,8 +19,16 @@ struct NotionClient: Sendable {
     static let apiVersion = "2026-03-11"
     private static let base = URL(string: "https://api.notion.com/v1/")!
 
+    /// 응답과 요청(Authorization 헤더 포함)을 디스크 캐시에 남기지 않는 세션
+    static let uncachedSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration)
+    }()
+
     let token: String
-    var session: URLSession = .shared
+    var session: URLSession = NotionClient.uncachedSession
 
     /// DB 이름과 데이터 소스 ID를 얻는다
     func database(id: String) async throws -> NotionDatabase {

@@ -23,15 +23,25 @@ enum Keychain {
         return String(data: data, encoding: .utf8)
     }
 
-    /// nil이나 빈 글자를 주면 지운다
-    static func set(_ value: String?, for key: String) {
-        SecItemDelete(query(key) as CFDictionary)
-        guard let value, !value.isEmpty else { return }
-        var item = query(key)
-        item[kSecValueData as String] = Data(value.utf8)
-        // 잠금 화면에서 백그라운드 새로고침이 돌 때도 읽을 수 있게 한다
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(item as CFDictionary, nil)
+    /// nil이나 빈 글자를 주면 지운다. 저장(또는 삭제)에 성공했는지 돌려준다.
+    /// 있던 값은 지우고 다시 넣지 않고 그 자리에서 바꾼다. 쓰기에 실패해도 옛 값이 남는다.
+    @discardableResult
+    static func set(_ value: String?, for key: String) -> Bool {
+        guard let value, !value.isEmpty else {
+            let status = SecItemDelete(query(key) as CFDictionary)
+            return status == errSecSuccess || status == errSecItemNotFound
+        }
+        let attributes: [String: Any] = [
+            kSecValueData as String: Data(value.utf8),
+            // 이 기기에만 둔다. 백업을 다른 기기로 옮겨도 토큰은 따라가지 않는다.
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        var status = SecItemUpdate(query(key) as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            let item = query(key).merging(attributes) { _, new in new }
+            status = SecItemAdd(item as CFDictionary, nil)
+        }
+        return status == errSecSuccess
     }
 }
 
@@ -49,9 +59,10 @@ struct Connection: Equatable {
         return Connection(token: token, databaseID: database)
     }
 
-    func save() {
-        Keychain.set(token, for: Self.tokenKey)
-        Keychain.set(databaseID, for: Self.databaseKey)
+    /// 둘 다 저장돼야 성공이다. DB를 먼저 넣어, 실패해도 쓰던 토큰은 남게 한다.
+    @discardableResult
+    func save() -> Bool {
+        Keychain.set(databaseID, for: Self.databaseKey) && Keychain.set(token, for: Self.tokenKey)
     }
 
     static func clear() {

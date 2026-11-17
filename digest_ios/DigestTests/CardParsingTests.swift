@@ -11,12 +11,12 @@ struct CardParsingTests {
       "results": [
         {
           "object": "page",
-          "id": "4183ae0b-75f5-814b-96a0-dd82d8e32565",
+          "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
           "created_time": "2026-11-14T19:00:00.000Z",
           "last_edited_time": "2026-11-14T19:01:00.000Z",
           "in_trash": false,
           "is_archived": false,
-          "url": "https://www.notion.so/4183ae0b75f5814b96a0dd82d8e32565",
+          "url": "https://www.notion.so/aaaaaaaabbbbccccddddeeeeeeeeeeee",
           "parent": {"type": "data_source_id", "data_source_id": "x", "database_id": "y"},
           "properties": {
             "태그": {"id": "a", "type": "multi_select", "multi_select": [
@@ -84,7 +84,7 @@ struct CardParsingTests {
 
     @Test func readsAllSixProperties() throws {
         let card = try #require(try cards()[0])
-        #expect(card.id == "4183ae0b-75f5-814b-96a0-dd82d8e32565")
+        #expect(card.id == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         #expect(card.title == "제목입니다")
         #expect(card.summary == "앞부분 뒷부분")
         #expect(card.source == "당근 테크 블로그 - Medium")
@@ -130,10 +130,28 @@ struct CardParsingTests {
         #expect(body.displayBlocks(summary: "다른 문장").first?.kind == .callout)
     }
 
+    @Test func onlyWebLinksAreKept() {
+        #expect(URL(webString: "https://example.com/post")?.absoluteString == "https://example.com/post")
+        #expect(URL(webString: " http://example.com/post ")?.scheme == "http")
+        #expect(URL(webString: "HTTPS://Example.com")?.host == "Example.com")
+        // 피드가 넣은 다른 스킴은 "원문 보기"가 엉뚱한 앱을 띄우지 않게 버린다
+        #expect(URL(webString: "tel:01012345678") == nil)
+        #expect(URL(webString: "sms:01012345678") == nil)
+        #expect(URL(webString: "itms-apps://apps.apple.com/app/id1") == nil)
+        #expect(URL(webString: "javascript:alert(1)") == nil)
+        #expect(URL(webString: "file:///etc/hosts") == nil)
+        #expect(URL(webString: "https://") == nil)
+        #expect(URL(webString: "example.com/post") == nil)
+        #expect(URL(webString: "") == nil)
+        // Notion 페이지 주소는 https만 받는다
+        #expect(URL(webString: "http://www.notion.so/abc", httpsOnly: true) == nil)
+        #expect(URL(webString: "https://www.notion.so/abc", httpsOnly: true) != nil)
+    }
+
     @Test func databaseIDIsExtractedFromAddressOrID() {
-        let id = "ba591c8b4bda4127b1a75fa6dc455f85"
+        let id = "0123456789abcdef0123456789abcdef"
         #expect(Connection.databaseID(from: id) == id)
-        #expect(Connection.databaseID(from: "  BA591C8B-4BDA-4127-B1A7-5FA6DC455F85 ") == id)
+        #expect(Connection.databaseID(from: "  01234567-89AB-CDEF-0123-456789ABCDEF ") == id)
         #expect(Connection.databaseID(from: "https://www.notion.so/me/Reeder-\(id)?v=11111111111111111111111111111111") == id)
         // 이름 끝이 16진수 글자(feed)여도 ID에 섞이지 않는다
         #expect(Connection.databaseID(from: "https://www.notion.so/my-feed-\(id)") == id)

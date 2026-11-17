@@ -22,6 +22,9 @@ final class AppState {
     /// 상세에서 이전·다음 글로 넘길 순서. 상세로 들어갈 때의 목록 그대로다(필터·검색 결과 포함).
     private(set) var readingOrder: [String] = []
 
+    /// `launch()`가 저장된 카드를 읽은 뒤에만 앱 복귀 처리를 한다
+    private var didLaunch = false
+
     /// 표본 카드로 실행 중 (Debug 실행 인자 `-mockData YES`)
     let isMock: Bool
 
@@ -75,6 +78,7 @@ final class AppState {
         cards.loadFromDisk()
         bodies.loadFromDisk()
         saved.loadFromDisk()
+        didLaunch = true
         #if DEBUG
         applyDebugScreen()
         #endif
@@ -99,12 +103,16 @@ final class AppState {
         return client
     }
 
-    /// 앱으로 돌아왔을 때: 마지막 동기화가 오래됐으면 다시 받는다
+    /// 앱으로 돌아왔을 때: 마지막 동기화가 오래됐거나 아직 한 번도 못 받았으면 다시 받는다.
+    /// 그럴 때가 아니어도, 네트워크 오류로 멈춘 핵심 미리 받기는 이어서 받는다.
     func didBecomeActive() async {
         beginVisit()
-        guard let last = cards.meta.lastSyncAt else { return }
-        if Date.now.timeIntervalSince(last) > Self.refreshInterval {
+        guard didLaunch, let connection else { return }
+        let isStale = cards.meta.lastSyncAt.map { Date.now.timeIntervalSince($0) > Self.refreshInterval } ?? true
+        if isStale {
             await refresh()
+        } else if cards.state == .idle, !bodies.isPrefetching {
+            bodies.startPrefetch(cards.cards, using: client(for: connection))
         }
     }
 
@@ -130,8 +138,13 @@ final class AppState {
             if let failure = ConnectCheck.failure(in: schema.properties.mapValues(\.type)) { return failure }
 
             // 다른 DB로 바꾸면 받아 둔 것은 쓸모가 없다. 토큰만 바꾸면 그대로 둔다.
+            guard candidate.save() else {
+                return .other("토큰을 이 기기에 저장하지 못했어요. 잠금을 푼 상태에서 다시 시도하세요.")
+            }
             if let connection, connection.databaseID != databaseID { clearLocalData() }
-            candidate.save()
+            // 옛 토큰으로 돌던 동기화와 미리 받기가 새 연결의 결과에 섞이지 않게 버린다
+            cards.cancelSync()
+            bodies.stopPrefetch()
             connection = candidate
             cards.updateMeta {
                 $0.dataSourceID = source.id
@@ -155,6 +168,8 @@ final class AppState {
     }
 
     private func clearLocalData() {
+        // 예전 빌드가 공용 세션으로 받은 응답이 캐시에 남아 있을 수 있다
+        URLCache.shared.removeAllCachedResponses()
         bodies.reset()
         cards.reset()
         saved.reset()

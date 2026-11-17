@@ -106,6 +106,7 @@ struct ConnectView: View {
                 }
                 ToolbarSpacer(.flexible, placement: .bottomBar)
             }
+            .interactiveDismissDisabled(isConnecting)
             .task { prepare() }
         }
     }

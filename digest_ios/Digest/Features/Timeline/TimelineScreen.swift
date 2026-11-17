@@ -5,7 +5,6 @@ import SwiftUI
 /// 왼쪽 아래는 무엇을 볼지(필터), 오른쪽 아래는 찾기(검색).
 struct TimelineScreen: View {
     @Environment(AppState.self) private var app
-    @Environment(\.openURL) private var openURL
 
     @State private var filter = TimelineFilter()
     @State private var query = ""
@@ -203,13 +202,9 @@ struct TimelineScreen: View {
         .accessibilityAction(named: "원문 보기") { openOriginal(card) }
     }
 
+    /// 원문은 앱 안 Safari로만 연다. 웹 주소가 아니면 열지 않는다.
     private func openOriginal(_ card: Card) {
-        guard let url = card.link else { return }
-        if let link = WebLink(url) {
-            webLink = link
-        } else {
-            openURL(url)
-        }
+        webLink = card.link.flatMap(WebLink.init)
     }
 
     // MARK: - 툴바

@@ -62,6 +62,8 @@ final class CardStore {
     /// 표본 데이터로 실행할 때는 기기 저장 내용을 건드리지 않는다
     private let persists: Bool
     private var syncTask: Task<Void, Never>?
+    /// 동기화를 버릴 때마다 올린다. 버려진 작업이 뒤늦게 끝나도 상태를 건드리지 못하게 한다.
+    private var generation = 0
     private var byID: [String: Card] = [:]
 
     static let fileName = "cards.json"
@@ -106,15 +108,32 @@ final class CardStore {
         let task = Task { await performSync(using: client, databaseID: databaseID, forceFull: forceFull) }
         syncTask = task
         await task.value
+        // 기다리는 사이에 버려지고 새 동기화가 시작됐으면 그 작업을 지우지 않는다
+        if syncTask == task { syncTask = nil }
+    }
+
+    /// 돌고 있는 동기화를 버린다. 토큰이나 DB를 바꿀 때, 옛 연결로 받던 결과가 섞이지 않게 한다.
+    func cancelSync() {
+        syncTask?.cancel()
         syncTask = nil
+        generation += 1
+        state = .idle
+    }
+
+    /// 이 동기화가 아직 유효한지 본다. 버려졌으면 던진다.
+    private func checkCurrent(_ generation: Int) throws {
+        try Task.checkCancellation()
+        if generation != self.generation { throw CancellationError() }
     }
 
     private func performSync(using client: NotionClient, databaseID: String, forceFull: Bool) async {
+        let generation = generation
         state = .syncing
         let started = Date.now
         do {
             if meta.dataSourceID == nil {
                 let database = try await client.database(id: databaseID)
+                try checkCurrent(generation)
                 guard let source = database.data_sources?.first else { throw NotionError.notFound }
                 updateMeta {
                     $0.dataSourceID = source.id
@@ -131,6 +150,8 @@ final class CardStore {
             var cursor: String?
             repeat {
                 let page = try await client.query(dataSourceID: dataSourceID, editedAfter: editedAfter, cursor: cursor)
+                // 받는 사이에 연결을 끊었으면 옛 카드를 다시 채우지 않는다
+                try checkCurrent(generation)
                 pages += page.results
                 cursor = page.has_more ? page.next_cursor : nil
             } while cursor != nil
@@ -146,12 +167,14 @@ final class CardStore {
             }
             state = .idle
         } catch is CancellationError {
-            state = .idle
+            if generation == self.generation { state = .idle }
         } catch let error as NotionError {
+            guard generation == self.generation else { return }
             // DB가 바뀌었을 수 있으니 데이터 소스 ID는 다음에 다시 찾는다
             if error == .notFound { updateMeta { $0.dataSourceID = nil } }
             state = .failed(error)
         } catch {
+            guard generation == self.generation else { return }
             state = .failed(.invalidResponse)
         }
     }
@@ -165,7 +188,7 @@ final class CardStore {
     }
 
     func reset() {
-        syncTask?.cancel()
+        cancelSync()
         cards = []
         sections = []
         tagCounts = []
