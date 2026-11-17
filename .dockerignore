@@ -12,3 +12,6 @@ README.md
 docker-compose.yml
 nginx-rss.conf.example
 crontab.example
+# iOS 앱과 문서는 다이제스트 이미지와 무관하다
+digest_ios/
+docs/
