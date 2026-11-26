@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Reeder(안 읽은 글) → FreshRSS → claude -p 요약 → Notion → 읽음 처리
+FreshRSS(새로 들어온 글) → claude -p 요약 → Notion
 
-매일 새벽, 안 읽은(unread) 글을 가져와 Claude Code(`claude -p`)로 한국어 요약한 뒤
-Notion 'Reeder 읽기 요약' DB에 카드로 쌓고, 처리한 글은 FreshRSS에서 읽음 처리한다.
-(읽음 처리가 곧 중복 방지 — 다음 실행 때 다시 잡히지 않음)
-발행된 지 MAX_AGE_DAYS일이 넘은 글은 요약하지 않고 읽음 처리만 한다.
-(블로그가 주소를 옮기면 FreshRSS가 예전 글 전체를 새 글로 다시 받기 때문)
+매일 새벽, 지난 실행 뒤에 FreshRSS에 새로 들어온 글을 읽음 여부와 상관없이 모두 가져와
+Claude Code(`claude -p`)로 한국어 요약한 뒤 Notion 'Reeder 읽기 요약' DB에 카드로 쌓는다.
+(11월 9일 04시에 돌았으면 11월 10일 04시에는 그 사이에 들어온 글 전부가 대상)
+
+- 어디까지 처리했는지는 상태 파일의 "커서"(마지막으로 처리한 글이 들어온 시각)로 기억한다.
+  Reeder에서 먼저 읽은 글도 빠지지 않는다.
+- 발행된 지 MAX_AGE_DAYS일이 넘은 글은 요약하지 않는다.
+  (블로그가 주소를 옮기면 FreshRSS가 예전 글 전체를 새 글로 다시 받기 때문)
+- MARK_READ=1이면 처리한 글을 FreshRSS에서 읽음으로 바꿔 Reeder를 비운다 (대상 선정과는 무관).
 
 특징:
 - 요약은 Claude Code 구독으로 처리 → 토큰당 API 과금 없음 (구독 사용량 한도 사용)
@@ -37,13 +41,27 @@ NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DB_ID = os.environ.get("NOTION_DB_ID", "ba591c8b4bda4127b1a75fa6dc455f85")
 NOTION_VERSION = "2022-06-28"
 
-MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "40"))    # 한 번에 처리할 최대 개수
-MARK_READ = os.environ.get("MARK_READ", "1") == "1"   # 0이면 읽음 처리 안 함(테스트용)
+MAX_ITEMS = int(os.environ.get("MAX_ITEMS") or "40")  # 한 번에 요약할 최대 개수 (넘치면 다음 실행으로)
+MARK_READ = os.environ.get("MARK_READ", "1") == "1"   # 1이면 처리한 글을 FreshRSS에서 읽음으로 바꾼다
+# 1이면 무엇을 처리할지만 보여 주고 아무것도 바꾸지 않는다 (요약·Notion·읽음 처리·상태 저장 없음)
+DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
+# 처음 실행(커서 없음)일 때 몇 시간 전부터 들어온 글을 볼지. 그 뒤로는 커서가 기준이다.
+LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS") or "24")
 # 발행된 지 이 일수가 넘은 글은 요약하지 않고 읽음 처리만 한다. 0이면 끈다(모든 글을 요약).
 MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS") or "30")
 SEEN_FILE = os.environ.get(
     "SEEN_FILE", os.path.expanduser("~/.freshrss_digest_seen.json")
 )
+# 커서와 실패 횟수를 두는 파일. seen 파일 옆에 둔다 (Docker에서는 /data 볼륨).
+STATE_FILE = os.environ.get("STATE_FILE") or os.path.join(
+    os.path.dirname(SEEN_FILE),
+    os.path.basename(SEEN_FILE).replace("seen", "state")
+    if "seen" in os.path.basename(SEEN_FILE) else os.path.basename(SEEN_FILE) + ".state",
+)
+
+PAGE_SIZE = 50       # FreshRSS에서 한 번에 받는 글 수
+MAX_PAGES = 100      # 구간이 아무리 길어도 이만큼만 넘긴다 (5,000개)
+MAX_ATTEMPTS = 3     # 같은 글의 요약이 이만큼 실패하면 포기하고 넘어간다
 
 READING_LIST = "user/-/state/com.google/reading-list"
 READ_TAG = "user/-/state/com.google/read"
@@ -74,13 +92,48 @@ def greader_headers(auth):
     return {"Authorization": f"GoogleLogin auth={auth}", "User-Agent": UA}
 
 
-def fetch_unread(auth, n):
-    """reading-list 에서 read 상태를 제외(xt) → 안 읽은 글만."""
-    url = (f"{FRESHRSS_BASE}/api/greader.php/reader/api/0/stream/contents/"
-           f"{urllib.parse.quote(READING_LIST, safe='')}"
-           f"?xt={urllib.parse.quote(READ_TAG, safe='')}&output=json&n={n}")
-    body = _request(url, headers=greader_headers(auth))
-    return json.loads(body).get("items", [])
+def arrived_usec(item):
+    """FreshRSS가 이 글을 받은 시각(마이크로초). 알 수 없으면 None.
+
+    FreshRSS는 글 ID를 받은 시각으로 만들고 `timestampUsec`로 내려 준다.
+    발행 시각과 달리 피드가 뒤늦게 올린 글도 '받은 때'로 잡힌다.
+    """
+    for key, scale in (("timestampUsec", 1), ("crawlTimeMsec", 1000)):
+        try:
+            value = int(item.get(key)) * scale
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def is_read(item):
+    return READ_TAG in (item.get("categories") or [])
+
+
+def fetch_since(auth, since_usec):
+    """since_usec 뒤에 FreshRSS에 들어온 글을 읽음 여부와 상관없이 모두, 들어온 순서로 돌려준다.
+
+    API의 시간 필터(ot)는 받은 시각 기준이 아니어서 쓰지 않는다. 최신순으로 넘기며
+    받은 시각을 직접 비교하고, 구간에 드는 글이 하나도 없는 쪽이 나오면 멈춘다.
+    """
+    base = (f"{FRESHRSS_BASE}/api/greader.php/reader/api/0/stream/contents/"
+            f"{urllib.parse.quote(READING_LIST, safe='')}?output=json&n={PAGE_SIZE}")
+    found, continuation = {}, None
+    for _ in range(MAX_PAGES):
+        url = base + (f"&c={urllib.parse.quote(str(continuation), safe='')}" if continuation else "")
+        data = json.loads(_request(url, headers=greader_headers(auth)))
+        page = data.get("items", [])
+        fresh = [it for it in page if (arrived_usec(it) or since_usec + 1) > since_usec]
+        for it in fresh:
+            found.setdefault(it.get("id"), it)
+        continuation = data.get("continuation")
+        if not fresh or not continuation:
+            break
+    else:
+        print(f"경고: 구간이 너무 길어 {MAX_PAGES * PAGE_SIZE}개까지만 봤습니다.", file=sys.stderr)
+    return sorted(found.values(), key=lambda it: arrived_usec(it) or since_usec + 1)
 
 
 def get_write_token(auth):
@@ -253,7 +306,9 @@ def notion_create(title, source, url, date_iso, tags, summary_line, key_points):
     )
 
 
-# ── seen 파일 (읽음 처리 실패 대비 안전망) ────────────────────────
+# ── 상태 파일 ─────────────────────────────────────────────────────
+# seen : 이미 처리한 글 ID. 커서가 뒤로 물러났을 때 같은 글을 두 번 요약하지 않게 한다.
+# state: 커서(어디까지 처리했나)와 글마다 실패한 횟수.
 def load_seen():
     try:
         with open(SEEN_FILE, encoding="utf-8") as f:
@@ -263,11 +318,35 @@ def load_seen():
 
 
 def save_seen(seen):
+    _save_json(SEEN_FILE, sorted(seen))
+
+
+def load_state():
     try:
-        with open(SEEN_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(seen), f, ensure_ascii=False)
+        with open(STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    _save_json(STATE_FILE, state)
+
+
+def _save_json(path, value):
+    """쓰다가 죽어도 파일이 깨지지 않게 옆에 쓰고 바꿔 끼운다."""
+    try:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(value, f, ensure_ascii=False)
+        os.replace(tmp, path)
     except Exception as e:
-        print(f"경고: seen 파일 저장 실패: {e}", file=sys.stderr)
+        print(f"경고: {path} 저장 실패: {e}", file=sys.stderr)
+
+
+def _when(usec):
+    return datetime.datetime.fromtimestamp(usec / 1_000_000).strftime("%Y-%m-%d %H:%M")
 
 
 # ── 메인 ──────────────────────────────────────────────────────────
@@ -278,60 +357,120 @@ def main():
     }.items() if not v]
     if missing:
         sys.exit(f"ERROR: 필수 환경변수 누락: {', '.join(missing)} (.env 확인)")
-    if not shutil.which(CLAUDE_BIN):
+    if not DRY_RUN and not shutil.which(CLAUDE_BIN):
         sys.exit(f"ERROR: '{CLAUDE_BIN}' 실행 파일을 찾을 수 없음. "
                  "Claude Code 설치 + Pro/Max 구독 로그인 후 PATH 확인.")
 
+    state = load_state()
+    cursor = state.get("cursor_usec")
+    if isinstance(cursor, int) and cursor > 0:
+        since = cursor
+    else:
+        since = int((time.time() - LOOKBACK_HOURS * 3600) * 1_000_000)
+        print(f"저장된 커서가 없어 최근 {LOOKBACK_HOURS:g}시간을 봅니다.")
+    failures = state.get("failures") if isinstance(state.get("failures"), dict) else {}
+
     auth = greader_login()
-    items = fetch_unread(auth, MAX_ITEMS)
+    items = fetch_since(auth, since)
     seen = load_seen()
     todo = [it for it in items if it.get("id") not in seen]
-    print(f"안 읽은 글 {len(items)}개(최대 {MAX_ITEMS}) 중 신규 {len(todo)}개 처리")
+    print(f"{_when(since)} 뒤에 들어온 글 {len(items)}개 중 처리할 글 {len(todo)}개"
+          f" (읽음 {sum(is_read(it) for it in todo)}개 포함, 한 번에 최대 {MAX_ITEMS}개 요약)")
 
-    write_token = get_write_token(auth) if (MARK_READ and todo) else None
-    done = 0
-    skipped = 0
-    for it in todo:
+    write_token = get_write_token(auth) if (MARK_READ and todo and not DRY_RUN) else None
+
+    def finish(iid, was_read):
+        """처리를 마친 글: 다시 잡히지 않게 기록하고, 원하면 읽음으로 바꾼다."""
+        seen.add(iid)
+        failures.pop(iid, None)
+        save_seen(seen)
+        if write_token and not was_read:
+            try:
+                mark_read(auth, write_token, iid)
+            except Exception as e:
+                # 읽음 처리는 부가 기능이다. 실패해도 요약은 끝났으니 다시 요약하지 않는다.
+                print(f"  경고: 읽음 처리 실패 — {e}", file=sys.stderr)
+
+    done = skipped = given_up = 0
+    reached = since      # 여기까지는 살펴봤다
+    retry_from = None    # 다음에 다시 시도할 글 가운데 가장 먼저 들어온 것
+    left = 0
+    for index, it in enumerate(todo):
         iid = it.get("id", "")
         title = it.get("title", "(제목 없음)")
         source = (it.get("origin") or {}).get("title", "")
         url = item_url(it)
+        arrived = arrived_usec(it) or since + 1
         published = published_time(it)
         date_iso = (datetime.date.fromtimestamp(published).isoformat()
                     if published else datetime.date.today().isoformat())
+        stale = is_stale(published)
+
+        if not stale and done >= MAX_ITEMS:
+            # 오늘 몫을 다 썼다. 남은 글은 커서를 여기 세워 두고 다음 실행에서 이어 한다.
+            left = sum(1 for rest in todo[index:] if not is_stale(published_time(rest)))
+            break
+
+        if DRY_RUN:
+            mark = "⏭ 오래됨" if stale else "📝 요약"
+            print(f"  {mark} | 들어옴 {_when(arrived)} | 발행 {date_iso} |"
+                  f" {'읽음' if is_read(it) else '안읽음'} | {source[:20]} | {title[:50]}")
+            skipped, done = skipped + stale, done + (not stale)
+            reached = max(reached, arrived)
+            continue
+
+        if stale:
+            # 오래된 글은 요약하지 않는다 (피드 주소 이전으로 옛 글이 몰려올 때)
+            finish(iid, is_read(it))
+            skipped += 1
+            reached = max(reached, arrived)
+            print(f"  ⏭ {title} — {date_iso} 발행, {MAX_AGE_DAYS}일이 넘어 요약 안 함")
+            continue
+
         try:
-            # 오래된 글은 요약하지 않고 읽음으로만 넘긴다 (피드 주소 이전으로 옛 글이 몰려올 때)
-            if is_stale(published):
-                if MARK_READ:
-                    if write_token:
-                        mark_read(auth, write_token, iid)
-                    seen.add(iid)
-                skipped += 1
-                print(f"  ⏭ {title} — {date_iso} 발행, {MAX_AGE_DAYS}일이 넘어 요약 안 함")
-                continue
             summary = claude_summarize(title, source, item_text(it))
             notion_create(title, source, url, date_iso,
                           summary["tags"], summary["summary_line"],
                           summary["key_points"])
-            # MARK_READ=0(테스트)일 땐 seen 에 기록하지 않는다 →
-            # 실제 실행(MARK_READ=1) 때 그 글들을 다시 처리해 읽음으로 넘길 수 있게.
-            if MARK_READ:
-                if write_token:
-                    mark_read(auth, write_token, iid)
-                seen.add(iid)
-            done += 1
-            print(f"  ✅ {title}")
-        except urllib.error.HTTPError as e:
-            print(f"  ❌ {title} — HTTP {e.code}: "
-                  f"{e.read().decode('utf-8', 'replace')[:300]}", file=sys.stderr)
         except Exception as e:
-            print(f"  ❌ {title} — {e}", file=sys.stderr)
+            detail = (f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"
+                      if isinstance(e, urllib.error.HTTPError) else str(e))
+            failures[iid] = int(failures.get(iid, 0)) + 1
+            if failures[iid] >= MAX_ATTEMPTS:
+                # 계속 실패하는 글 하나가 커서를 영영 붙잡지 않게 포기한다
+                print(f"  ❌ {title} — {detail} ({MAX_ATTEMPTS}번 실패, 포기)", file=sys.stderr)
+                finish(iid, True)
+                given_up += 1
+            else:
+                print(f"  ❌ {title} — {detail} (다음 실행에서 다시 시도)", file=sys.stderr)
+                retry_from = arrived if retry_from is None else min(retry_from, arrived)
+            reached = max(reached, arrived)
+            continue
 
-    if MARK_READ:
-        save_seen(seen)
-    print(f"완료: {done}개 노션에 추가" + (", 읽음 처리됨" if MARK_READ else "")
-          + (f" · 오래된 글 {skipped}개는 요약 없이 "
-             + ("읽음 처리" if MARK_READ else "건너뜀") if skipped else ""))
+        finish(iid, is_read(it))
+        done += 1
+        reached = max(reached, arrived)
+        print(f"  ✅ {title}")
+
+    if DRY_RUN:
+        print(f"DRY_RUN: 요약할 글 {done}개, 오래돼서 건너뛸 글 {skipped}개"
+              + (f", 다음 실행으로 넘어갈 글 {left}개" if left else "") + " — 아무것도 바꾸지 않았습니다.")
+        return
+
+    # 다시 시도할 글이 있으면 커서를 그 글 바로 앞에 둔다. 그 뒤의 끝난 글은 seen이 걸러 준다.
+    new_cursor = reached if retry_from is None else min(reached, retry_from - 1)
+    state["cursor_usec"] = max(new_cursor, since if retry_from is None else 0)
+    state["failures"] = {k: v for k, v in failures.items() if k not in seen}
+    state["last_run"] = datetime.datetime.now().isoformat(timespec="seconds")
+    save_state(state)
+    save_seen(seen)
+
+    print(f"완료: {done}개 노션에 추가"
+          + (f" · 오래된 글 {skipped}개는 요약 안 함" if skipped else "")
+          + (f" · {given_up}개는 계속 실패해 포기" if given_up else "")
+          + (f" · 다시 시도할 글 있음" if retry_from is not None else "")
+          + (f" · 남은 {left}개는 다음 실행에서" if left else "")
+          + f" · 커서 {_when(state['cursor_usec'])}")
 
 
 if __name__ == "__main__":
