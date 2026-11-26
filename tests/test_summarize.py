@@ -74,7 +74,10 @@ class Pipeline:
             if "c" in query:
                 newest_first = [a for a in newest_first if int(a["timestampUsec"]) <= int(query["c"][0])]
             page, rest = newest_first[:size], newest_first[size:]
-            body = {"items": page}
+            # undated 글은 FreshRSS가 받은 시각을 주지 않은 것처럼 내보낸다
+            body = {"items": [
+                {k: v for k, v in a.items() if k not in ("timestampUsec", "crawlTimeMsec", "undated")}
+                if a.get("undated") else a for a in page]}
             if rest:
                 body["continuation"] = rest[0]["timestampUsec"]
             return json.dumps(body)
@@ -171,6 +174,57 @@ class SummarizeTests(unittest.TestCase):
         self.assertEqual(len(self.p.created), 130)
         self.assertEqual(self.p.created, sorted(self.p.created))
         self.assertGreaterEqual(self.p.requests, 3)
+
+    def test_stops_paging_once_past_the_cursor(self):
+        self.p.articles = [article(f"옛 글 {i:03d}", 3 * DAY + i * 60) for i in range(130)]
+        self.p.articles += [article("새 글 1", 2 * HOUR), article("새 글 2", HOUR)]
+        self.p.run()
+        self.assertEqual(self.p.created, ["새 글 1", "새 글 2"])
+        self.assertEqual(self.p.requests, 2)  # 구간에 드는 글이 없는 쪽에서 멈춘다
+
+    def test_articles_without_arrival_time_are_left_out(self):
+        self.p.articles = [dict(article(f"시각 없는 글 {i:03d}", 3 * DAY + i * 60), undated=True) for i in range(120)]
+        self.p.articles.append(article("새 글", HOUR))
+        self.p.run()
+        self.assertEqual(self.p.created, ["새 글"])
+        self.assertEqual(self.p.requests, 2)  # 시각 없는 글이 페이지 넘김을 붙잡지 않는다
+        self.assertIn("받은 시각이 없는 글", self.p.err)
+
+    def test_same_arrival_time_at_the_cap_is_not_lost(self):
+        first, second = article("같은 시각 1", HOUR), article("같은 시각 2", HOUR)
+        self.assertEqual(first["timestampUsec"], second["timestampUsec"])
+        self.p.articles = [first, second]
+        self.p.run(MAX_ITEMS=1)
+        self.p.run(MAX_ITEMS=1)
+        self.assertEqual(len(self.p.seen()), 2)  # 상한에 밀린 글을 커서가 지나치지 않는다
+        self.p.run(MAX_ITEMS=1)
+        self.assertEqual(self.p.created, [])
+
+    def test_only_web_links_are_used(self):
+        self.p.run()
+        url = self.p.module.item_url
+        self.assertEqual(url({"alternate": [{"href": "https://blog.test/a"}]}), "https://blog.test/a")
+        # 피드가 정하는 값이다. 서버의 파일을 읽게 하거나 Notion이 거절할 주소는 버린다
+        self.assertEqual(url({"alternate": [{"href": "file:///proc/self/environ"}]}), "")
+        self.assertEqual(url({"canonical": [{"href": "javascript:alert(1)"}],
+                              "alternate": [{"href": "http://blog.test/b"}]}), "http://blog.test/b")
+        self.assertEqual(url({"alternate": [{"href": "https://blog.test/" + "a" * 2000}]}), "")
+        self.assertEqual(url({"alternate": ["https://blog.test/a"]}), "")
+
+    def test_fails_loudly_when_progress_cannot_be_saved(self):
+        self.p.articles = [article("글", HOUR)]
+        missing = os.path.join(self.tmp.name, "없는 폴더", "freshrss_digest_seen.json")
+        with self.assertRaises(SystemExit) as raised:
+            self.p.run(SEEN_FILE=missing)
+        self.assertIn("저장하지 못했습니다", str(raised.exception))
+
+    def test_unreadable_state_file_is_reported(self):
+        self.p.articles = [article("글", HOUR)]
+        with open(os.path.join(self.tmp.name, "freshrss_digest_state.json"), "w", encoding="utf-8") as f:
+            f.write("{깨진 파일")
+        self.p.run()
+        self.assertIn("읽지 못해", self.p.err)
+        self.assertEqual(self.p.created, ["글"])
 
     def test_old_articles_are_not_summarized(self):
         # 주소 이전: 옛 글이 '방금 들어온 글'로 다시 온다

@@ -120,20 +120,25 @@ def fetch_since(auth, since_usec):
     """
     base = (f"{FRESHRSS_BASE}/api/greader.php/reader/api/0/stream/contents/"
             f"{urllib.parse.quote(READING_LIST, safe='')}?output=json&n={PAGE_SIZE}")
-    found, continuation = {}, None
+    found, continuation, undated = {}, None, 0
     for _ in range(MAX_PAGES):
         url = base + (f"&c={urllib.parse.quote(str(continuation), safe='')}" if continuation else "")
         data = json.loads(_request(url, headers=greader_headers(auth)))
         page = data.get("items", [])
-        fresh = [it for it in page if (arrived_usec(it) or since_usec + 1) > since_usec]
+        # 받은 시각이 없는 글은 언제 들어왔는지 알 수 없어 구간에 넣지 않는다 (FreshRSS는 늘 채워 보낸다)
+        undated += sum(1 for it in page if arrived_usec(it) is None)
+        fresh = [it for it in page if (arrived_usec(it) or 0) > since_usec]
         for it in fresh:
             found.setdefault(it.get("id"), it)
         continuation = data.get("continuation")
         if not fresh or not continuation:
             break
     else:
-        print(f"경고: 구간이 너무 길어 {MAX_PAGES * PAGE_SIZE}개까지만 봤습니다.", file=sys.stderr)
-    return sorted(found.values(), key=lambda it: arrived_usec(it) or since_usec + 1)
+        print(f"경고: 구간이 너무 길어 최근 {MAX_PAGES * PAGE_SIZE}개까지만 봤습니다."
+              " 그보다 먼저 들어온 글은 건너뜁니다.", file=sys.stderr)
+    if undated:
+        print(f"경고: 받은 시각이 없는 글 {undated}개는 건너뜁니다.", file=sys.stderr)
+    return sorted(found.values(), key=arrived_usec)
 
 
 def get_write_token(auth):
@@ -210,10 +215,17 @@ def fetch_url_text(url):
 
 
 def item_url(item):
+    """글의 웹 주소. 피드가 정하는 값이라 http(s)만 받는다.
+
+    file:// 같은 주소를 받아 주면 본문을 가져올 때 서버의 파일을 읽게 되고,
+    Notion은 웹 주소가 아니거나 2000자를 넘는 링크를 거절한다.
+    """
     for key in ("canonical", "alternate"):
         arr = item.get(key) or []
-        if arr and arr[0].get("href"):
-            return arr[0]["href"]
+        href = arr[0].get("href") if arr and isinstance(arr[0], dict) else None
+        if (isinstance(href, str) and len(href) <= 2000
+                and href.lower().startswith(("http://", "https://"))):
+            return href
     return ""
 
 
@@ -310,28 +322,33 @@ def notion_create(title, source, url, date_iso, tags, summary_line, key_points):
 # seen : 이미 처리한 글 ID. 커서가 뒤로 물러났을 때 같은 글을 두 번 요약하지 않게 한다.
 # state: 커서(어디까지 처리했나)와 글마다 실패한 횟수.
 def load_seen():
-    try:
-        with open(SEEN_FILE, encoding="utf-8") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
+    value = _load_json(SEEN_FILE)
+    return set(value) if isinstance(value, list) else set()
 
 
 def save_seen(seen):
-    _save_json(SEEN_FILE, sorted(seen))
+    return _save_json(SEEN_FILE, sorted(seen))
 
 
 def load_state():
+    value = _load_json(STATE_FILE)
+    return value if isinstance(value, dict) else {}
+
+
+def _load_json(path):
+    """파일이 없으면 None. 있는데 못 읽으면 알리고 None (없는 것처럼 이어 간다)."""
     try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            state = json.load(f)
-        return state if isinstance(state, dict) else {}
-    except Exception:
-        return {}
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"경고: {path} 을 읽지 못해 없는 것으로 봅니다: {e}", file=sys.stderr)
+        return None
 
 
 def save_state(state):
-    _save_json(STATE_FILE, state)
+    return _save_json(STATE_FILE, state)
 
 
 def _save_json(path, value):
@@ -341,8 +358,10 @@ def _save_json(path, value):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(value, f, ensure_ascii=False)
         os.replace(tmp, path)
+        return True
     except Exception as e:
         print(f"경고: {path} 저장 실패: {e}", file=sys.stderr)
+        return False
 
 
 def _when(usec):
@@ -393,14 +412,15 @@ def main():
 
     done = skipped = given_up = 0
     reached = since      # 여기까지는 살펴봤다
-    retry_from = None    # 다음에 다시 시도할 글 가운데 가장 먼저 들어온 것
+    resume_from = None   # 다음 실행이 다시 봐야 할 글(실패했거나 상한에 밀린 글) 가운데 가장 먼저 들어온 것
+    has_retry = False
     left = 0
     for index, it in enumerate(todo):
         iid = it.get("id", "")
         title = it.get("title", "(제목 없음)")
         source = (it.get("origin") or {}).get("title", "")
         url = item_url(it)
-        arrived = arrived_usec(it) or since + 1
+        arrived = arrived_usec(it)
         published = published_time(it)
         date_iso = (datetime.date.fromtimestamp(published).isoformat()
                     if published else datetime.date.today().isoformat())
@@ -409,6 +429,7 @@ def main():
         if not stale and done >= MAX_ITEMS:
             # 오늘 몫을 다 썼다. 남은 글은 커서를 여기 세워 두고 다음 실행에서 이어 한다.
             left = sum(1 for rest in todo[index:] if not is_stale(published_time(rest)))
+            resume_from = arrived if resume_from is None else min(resume_from, arrived)
             break
 
         if DRY_RUN:
@@ -443,7 +464,8 @@ def main():
                 given_up += 1
             else:
                 print(f"  ❌ {title} — {detail} (다음 실행에서 다시 시도)", file=sys.stderr)
-                retry_from = arrived if retry_from is None else min(retry_from, arrived)
+                resume_from = arrived if resume_from is None else min(resume_from, arrived)
+                has_retry = True
             reached = max(reached, arrived)
             continue
 
@@ -457,20 +479,22 @@ def main():
               + (f", 다음 실행으로 넘어갈 글 {left}개" if left else "") + " — 아무것도 바꾸지 않았습니다.")
         return
 
-    # 다시 시도할 글이 있으면 커서를 그 글 바로 앞에 둔다. 그 뒤의 끝난 글은 seen이 걸러 준다.
-    new_cursor = reached if retry_from is None else min(reached, retry_from - 1)
-    state["cursor_usec"] = max(new_cursor, since if retry_from is None else 0)
+    # 다시 봐야 할 글이 있으면 커서를 그 글 바로 앞에 둔다. 그 뒤의 끝난 글은 seen이 걸러 준다.
+    new_cursor = reached if resume_from is None else min(reached, resume_from - 1)
+    state["cursor_usec"] = max(new_cursor, since)
     state["failures"] = {k: v for k, v in failures.items() if k not in seen}
     state["last_run"] = datetime.datetime.now().isoformat(timespec="seconds")
-    save_state(state)
-    save_seen(seen)
+    saved = [save_seen(seen), save_state(state)]
 
     print(f"완료: {done}개 노션에 추가"
           + (f" · 오래된 글 {skipped}개는 요약 안 함" if skipped else "")
           + (f" · {given_up}개는 계속 실패해 포기" if given_up else "")
-          + (f" · 다시 시도할 글 있음" if retry_from is not None else "")
+          + (" · 다시 시도할 글 있음" if has_retry else "")
           + (f" · 남은 {left}개는 다음 실행에서" if left else "")
           + f" · 커서 {_when(state['cursor_usec'])}")
+    if not all(saved):
+        # 진행 상황을 못 남겼다. 다음 실행이 같은 글을 다시 요약할 수 있으니 실패로 끝낸다.
+        sys.exit(f"ERROR: 진행 상황을 저장하지 못했습니다. {os.path.dirname(STATE_FILE)} 에 쓸 수 있는지 확인하세요.")
 
 
 if __name__ == "__main__":
