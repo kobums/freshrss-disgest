@@ -10,6 +10,7 @@ freshrss-extensions/
 *.log
 digest-data/
 .freshrss_digest_seen.json
+.freshrss_digest_state.json
 
 .DS_Store
 __pycache__/

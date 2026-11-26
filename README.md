@@ -1,18 +1,21 @@
-# Reeder(안 읽은 글) → Claude 요약 → Notion → 읽기 요약 앱
+# FreshRSS(새로 들어온 글) → Claude 요약 → Notion → 읽기 요약 앱
 
-매일 새벽, **안 읽은 글**을 FreshRSS에서 가져와 Claude Code(`claude -p`, 구독)로 요약해
-Notion **"Reeder 읽기 요약"** DB에 쌓고, 처리한 글은 **읽음 처리**한다.
+매일 새벽, **지난 실행 뒤에 새로 들어온 글 전부**를 FreshRSS에서 가져와 Claude Code(`claude -p`, 구독)로
+요약해 Notion **"Reeder 읽기 요약"** DB에 쌓는다. 읽음 여부는 따지지 않는다 — Reeder에서 먼저 읽은 글도
+요약된다. (11월 9일 04시에 돌았으면 11월 10일 04시에는 그 사이에 들어온 글 전부가 대상)
+처리한 글은 FreshRSS에서 **읽음 처리**해 Reeder를 비운다.
 쌓인 요약은 iOS 앱 **"읽기 요약"**(`digest_ios/`)으로 폰에서 읽는다.
 → Reeder는 비워지고, 요약본이 읽는 화면이 된다.
 
 ```
 매일 04:00 (서버 cron → docker run)
    └─ kobums/freshrss-digest 컨테이너 (summarize_unread.py)
-        ├─ FreshRSS: 안 읽은 글 가져오기 (최신 MAX_ITEMS개)
-        ├─ 발행된 지 MAX_AGE_DAYS일이 넘은 글은 요약 없이 읽음 처리
-        ├─ claude -p: 한국어 요약 (구독 → API 과금 없음)
+        ├─ FreshRSS: 지난 실행(커서) 뒤에 들어온 글 전부 가져오기 (읽은 글 포함)
+        ├─ 발행된 지 MAX_AGE_DAYS일이 넘은 글은 요약하지 않음
+        ├─ claude -p: 한국어 요약 (구독 → API 과금 없음, 한 번에 MAX_ITEMS개까지)
         ├─ Notion: 카드 추가
-        └─ FreshRSS: 읽음 처리 (= 중복 방지)
+        ├─ FreshRSS: 읽음 처리 (Reeder 비우기, MARK_READ=0이면 안 함)
+        └─ /data: 커서 저장 (어디까지 처리했는지)
 
 iPhone "읽기 요약" 앱 (digest_ios/)
    └─ Notion API를 읽기 전용으로 직접 호출 (서버 없음, 파이프라인과 독립)
@@ -29,6 +32,7 @@ iPhone "읽기 요약" 앱 (digest_ios/)
 
 ## 구성 파일
 - `summarize_unread.py` — 파이프라인 메인 (표준 라이브러리만, 요약은 `claude -p` 호출)
+- `tests/test_summarize.py` — 대상 선정·커서·재시도 단위 테스트 (`python3 -m unittest discover -s tests`)
 - `Dockerfile` / `.dockerignore` — 배포 이미지 (`kobums/freshrss-digest`). 앱과 문서는 이미지에서 제외
 - `Makefile` — 이미지 빌드·푸시 (`make release`)
 - `docker-compose.yml` — 서버에 올릴 FreshRSS (요약 컨테이너와 별개)
@@ -79,13 +83,14 @@ make TAG=v1.0.0 release  # amd64+arm64 빌드 → kobums/freshrss-digest 푸시
 - `make build`(로컬 단일 아키) / `make push`(빌드+푸시) 도 있음. `make help`로 전체 확인.
 
 ## 9. 테스트 (상태 변경 없이)
-처음엔 `MARK_READ=0`으로 읽음 처리 없이 노션 적재만 확인한다.
+처음엔 `DRY_RUN=1`로 무엇이 처리될지만 본다. 요약도, 노션 적재도, 읽음 처리도, 커서 저장도 하지 않는다.
 ```bash
-docker run --rm --env-file .env -e MARK_READ=0 \
+docker run --rm --env-file .env -e DRY_RUN=1 \
   -v "$PWD/digest-data:/data" kobums/freshrss-digest:latest
 ```
-정상이면 `안 읽은 글 N개 ... 신규 M개 처리` → `✅ 제목` 로그가 뜨고 노션에 카드가 생긴다.
-확인되면 `.env`의 `MARK_READ=1`로 둔다. (Docker 없이 호스트에서 보려면 `MARK_READ=0 ./run.sh`)
+`… 뒤에 들어온 글 N개 중 처리할 글 M개` 아래에 글마다 `📝 요약`/`⏭ 오래됨`, 들어온 시각, 읽음 여부가 찍힌다.
+목록이 맞으면 `-e DRY_RUN=1`을 빼고 실행한다 → `✅ 제목` 로그가 뜨고 노션에 카드가 생긴다.
+(Docker 없이 호스트에서 보려면 `DRY_RUN=1 ./run.sh`. 처음 실행은 최근 24시간을 보며 `LOOKBACK_HOURS`로 바꾼다.)
 
 ## 10. 매일 4시 자동화 (서버 cron)
 ```bash
@@ -177,13 +182,23 @@ python3 digest_ios/tools/make_icon.py
 ---
 
 ## 동작 메모
-- **중복 방지**: 요약·적재 후 그 글을 읽음 처리 → 다음 실행 땐 안 잡힘. `/data`의 seen 파일은
-  읽음 처리가 실패한 글의 재적재를 막는 안전망(컨테이너 재시작에도 유지하려 볼륨 마운트).
-- **백로그 폭주 방지**: `MAX_ITEMS`(기본 40)만큼만 처리. 안 읽은 글이 수백 개면 며칠에 걸쳐
-  소화되고, 안정화되면 그날 들어온 새 글만 요약된다. 첫날 한 번에 비우려면 값을 크게.
-  (단, 30일이 넘은 글은 아래 규칙대로 요약 없이 읽음 처리된다.)
-- **오래된 글 거르기**: 발행된 지 `MAX_AGE_DAYS`(기본 30)일이 넘은 글은 요약하지 않고 읽음
-  처리만 한다(로그에 `⏭`). 블로그가 주소를 옮기면 FreshRSS가 예전 글 전체를 새 글로 다시
+- **무엇을 요약하나**: 지난 실행 뒤에 FreshRSS에 **들어온** 글 전부. 읽음 여부는 보지 않으므로
+  Reeder에서 먼저 읽은 글도 요약된다. 기준은 글의 발행 시각이 아니라 FreshRSS가 그 글을 받은
+  시각이라, 피드가 뒤늦게 올린 글도 빠지지 않는다.
+- **커서**: 어디까지 처리했는지를 `/data/freshrss_digest_state.json`에 "마지막으로 처리한 글이
+  들어온 시각"으로 적어 둔다. 서버가 며칠 쉬었다 돌아도 그 사이 글을 모두 잡는다. 이 파일이
+  없으면(처음 실행) 최근 `LOOKBACK_HOURS`(기본 24)시간을 본다. 컨테이너를 새로 띄워도 남도록
+  `/data`를 볼륨으로 물려야 한다.
+- **중복 방지**: 처리한 글의 ID를 `/data/freshrss_digest_seen.json`에 적는다. 커서가 뒤로 물러난
+  경우(아래 재시도)에도 같은 글을 두 번 요약하지 않는다.
+- **실패한 글**: 요약이나 노션 적재가 실패하면 커서를 그 글 앞에 세워 두고 다음 실행에서 다시
+  한다. 같은 글이 3번 실패하면 포기하고 넘어간다(로그에 `포기`).
+- **읽음 처리**: `MARK_READ=1`(기본)이면 처리한 글을 FreshRSS에서 읽음으로 바꿔 Reeder를 비운다.
+  대상 선정과는 무관하다. Reeder의 안 읽음 표시를 그대로 두고 싶으면 `MARK_READ=0`.
+- **하루 상한**: 한 번에 `MAX_ITEMS`(기본 40)개까지만 요약한다. 넘친 글은 먼저 들어온 순서로
+  다음 실행에 이어서 처리한다.
+- **오래된 글 거르기**: 발행된 지 `MAX_AGE_DAYS`(기본 30)일이 넘은 글은 요약하지 않는다
+  (로그에 `⏭`, 상한에 포함되지 않음). 블로그가 주소를 옮기면 FreshRSS가 예전 글 전체를 새 글로 다시
   받는데(2026-11 뱅크샐러드: 2017년 글까지 74개가 이틀에 걸쳐 다시 요약됨), 이를 막는다.
   피드를 새로 추가해 옛 글까지 요약하고 싶으면 그때만 `-e MAX_AGE_DAYS=0`으로 끈다.
   최근 30일 안의 글은 주소가 바뀌면 한 번 더 요약될 수 있다(글 ID가 새로 붙어 중복으로 못 봄).

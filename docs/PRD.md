@@ -21,7 +21,7 @@ Notion 앱으로도 볼 수 있지만 DB를 열고 카드를 하나씩 여는 �
 
 ### 2.1 파이프라인이 만드는 것
 
-`summarize_unread.py`가 FreshRSS의 안 읽은 글을 `claude -p`로 요약해 Notion DB "Reeder 읽기 요약"에 카드를 만든다.
+`summarize_unread.py`가 FreshRSS에 새로 들어온 글(2026-11-26부터 읽음 여부와 무관하게 지난 실행 뒤에 들어온 글 전부)을 `claude -p`로 요약해 Notion DB "Reeder 읽기 요약"에 카드를 만든다.
 
 | 위치 | 내용 |
 | --- | --- |
